@@ -716,6 +716,74 @@ def _cli_record(root, pid, started):
     }), encoding="utf-8")
 
 
+def test_stop_refuses_a_stale_or_unverifiable_cli_process():
+    import tempfile
+    from unittest.mock import patch
+
+    for saved, current, status in (
+        ("old", "new", "running"), ("", "current", "running"),
+        ("saved", "", "running"), ("same", "same", "exited"),
+        ("same", "same", "stopped"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _cli_record(root, 12345, saved)
+            record = json.loads((root / "abc.json").read_text())
+            record["status"] = status
+            (root / "abc.json").write_text(json.dumps(record))
+            captain = Captain(root)
+            with patch.object(_runner, "_proc_start", return_value=current), \
+                    patch.object(_runner.os, "killpg") as killpg, patch.object(_runner.os, "kill") as kill:
+                assert captain.stop("abc")["ok"] is False
+                killpg.assert_not_called()
+                kill.assert_not_called()
+            assert json.loads((root / "abc.json").read_text()) == record
+
+
+def test_stop_refuses_a_changed_or_unavailable_process_group():
+    import tempfile
+    from unittest.mock import patch
+
+    for group, starts, failure in (
+        (99999, ["saved"], None), (12345, ["saved", "new"], None),
+        (12345, ["saved", "saved"], ProcessLookupError()),
+        (12345, ["saved", "saved"], PermissionError()),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _cli_record(root, 12345, "saved")
+            before = (root / "abc.json").read_text()
+            captain = Captain(root)
+            with patch.object(_runner, "_proc_start", side_effect=starts), \
+                    patch.object(_runner.os, "getpgid", return_value=group), \
+                    patch.object(_runner.os, "killpg", side_effect=failure) as killpg, \
+                    patch.object(_runner.os, "kill") as kill:
+                assert captain.stop("abc")["ok"] is False
+                if failure is None:
+                    killpg.assert_not_called()
+                kill.assert_not_called()  # never fall back to a possibly recycled PID
+            assert (root / "abc.json").read_text() == before
+
+
+def test_stop_signals_only_the_verified_live_cli_process_group():
+    import tempfile
+    import signal
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _cli_record(root, 12345, "saved")
+        captain = Captain(root)
+        with patch.object(_runner, "_proc_start", return_value="saved") as identity, \
+                patch.object(_runner.os, "getpgid", return_value=12345), \
+                patch.object(_runner.os, "killpg") as killpg, patch.object(_runner.os, "kill") as kill:
+            assert captain.stop("abc")["ok"] is True
+            assert identity.call_count == 2
+            killpg.assert_called_once_with(12345, signal.SIGTERM)
+            kill.assert_not_called()
+        assert json.loads((root / "abc.json").read_text())["status"] == "stopped"
+
+
 def test_restart_rearms_a_cli_wait_only_for_the_same_process():
     import tempfile
     from hermes_captain.runner import _proc_start, _spawn

@@ -850,12 +850,21 @@ class Captain:
             return {"ok": ok, "output": "stopped" if ok else _clip(result.get("error") or result.get("stdout") or "")}
         if not pid or host:
             return {"ok": False, "output": "nothing to stop: this run has no process, thread, or terminal"}
+        if record.get("status") != "running":
+            return {"ok": False, "output": "nothing to stop: this run is no longer running"}
+        started = record.get("pid_started")
+        if not started or _proc_start(pid) != started:
+            return {"ok": False, "output": "process identity could not be verified; nothing signaled"}
         try:
+            if os.getpgid(int(pid)) != int(pid):
+                return {"ok": False, "output": "process group could not be verified; nothing signaled"}
+            if _proc_start(pid) != started:  # it may have exited while its group was checked
+                return {"ok": False, "output": "process identity changed; nothing signaled"}
             os.killpg(int(pid), signal.SIGTERM)
         except ProcessLookupError:
-            pass
+            return {"ok": False, "output": "process has exited; nothing signaled"}
         except PermissionError:
-            os.kill(int(pid), signal.SIGTERM)
+            return {"ok": False, "output": "permission denied signaling the process group; nothing signaled"}
         record["status"] = "stopped"
         self._save(run_id, record)
         return {"ok": True, "output": f"signaled {pid}"}
